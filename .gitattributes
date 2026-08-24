@@ -1,0 +1,6 @@
+*.pm text eol=lf
+*.t text eol=lf
+README.md text eol=lf
+controls_Judo.txt text eol=lf
+.githooks/* text eol=lf
+tools/*.pl text eol=lf

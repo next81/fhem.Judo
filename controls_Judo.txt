@@ -1,0 +1,6 @@
+UPD 2026-08-24_13:11:34 22508 FHEM/50_Judo.pm
+UPD 2026-08-24_11:53:36 4766 lib/FHEM/Judo/Auth.pm
+UPD 2026-08-24_11:56:19 14465 lib/FHEM/Judo/Connection.pm
+UPD 2026-08-24_12:45:45 15679 lib/FHEM/Judo/Profiles.pm
+UPD 2026-08-24_12:45:45 26472 lib/FHEM/Judo/Protocol.pm
+UPD 2026-08-24_13:11:34 5455 lib/FHEM/Judo/Runtime.pm
