@@ -46,4 +46,63 @@ unlike($source, qr/^sub Judo_(?:profile|get_descriptor|handle_success|apply_mode
 	'Laufzeitfunktionen sind aus dem Hauptmodul ausgelagert');
 like($source, qr/id="Judo-heartbeat"/, 'Heartbeat ist in der Commandref dokumentiert');
 
+my ($english_help) = $source =~ /=begin html\r?\n(.*?)\r?\n=end html\r?\n/s;
+my ($german_help) = $source =~ /=begin html_DE\r?\n(.*?)\r?\n=end html_DE\r?\n/s;
+ok(defined($english_help), 'englischer HTML-Hilfeblock ist vorhanden');
+ok(defined($german_help), 'deutscher HTML-Hilfeblock ist vorhanden');
+$english_help //= '';
+$german_help //= '';
+
+my %help_entries = (
+	set => { map { $_ => 1 } qw(clearPassword password reconnect) },
+	get => { map { $_ => 1 } qw(heartbeat model profile) },
+	attr => { map { $_ => 1 } qw(interval timeout maxFailures username ssl disable) },
+);
+my $profiles = Judo::Profiles::profiles();
+
+# Alle profilabhaengigen Befehle muessen dieselben kontextsensitiven Hilfeziele
+# wie die immer verfuegbaren Verwaltungsbefehle erhalten.
+for my $profile (values %$profiles) {
+
+	# Set- und Get-Deskriptoren bleiben die verbindliche Quelle der FHEMWEB-Auswahl.
+	for my $section (qw(set get)) {
+
+		for my $command (keys %{ $profile->{$section} }) {
+			$help_entries{$section}{$command} = 1;
+		}
+
+	}
+
+}
+
+# Beide Sprachvarianten muessen dieselben allgemeinen und spezifischen Anker
+# fuer set, get und attr anbieten.
+for my $language (
+	[ 'EN', $english_help ],
+	[ 'DE', $german_help ],
+) {
+	my ($label, $help) = @$language;
+
+	# Jeder Hilfebereich benoetigt den allgemeinen FHEMWEB-Sprunganker.
+	for my $section (qw(set get attr)) {
+		like(
+			$help,
+			qr{<a id="Judo-\Q$section\E"></a>},
+			"$label enthaelt den allgemeinen $section-Hilfeanker",
+		);
+
+		# Jeder auswaehlbare Wert muss direkt auf seinen Listeneintrag zeigen.
+		for my $entry (sort keys %{ $help_entries{$section} }) {
+			my $anchor = "Judo-$section-$entry";
+			like(
+				$help,
+				qr{<a id="\Q$anchor\E"></a>\s*<li>},
+				"$label enthaelt die kontextsensitive Hilfe fuer $section $entry",
+			);
+		}
+
+	}
+
+}
+
 done_testing;
