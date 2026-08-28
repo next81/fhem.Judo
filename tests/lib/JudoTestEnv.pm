@@ -10,10 +10,10 @@ use JSON::PP qw(encode_json);
 
 our @EXPORT_OK = qw(reset_env define_judo pending_requests complete_request
 	fail_request reading_value log_entries scheduled_timers set_attribute
-	key_values set_key_value_errors);
-our (@REQUESTS, @LOG_ENTRIES, @TIMERS);
+	key_values set_key_value_errors closed_requests advance_time fire_dispatch_timer);
+our (@REQUESTS, @CLOSED_REQUESTS, @LOG_ENTRIES, @TIMERS);
 our %KEY_VALUES;
-our ($SET_KEY_VALUE_ERROR, $GET_KEY_VALUE_ERROR);
+our ($SET_KEY_VALUE_ERROR, $GET_KEY_VALUE_ERROR, $NOW);
 
 # Setzt die simulierte FHEM-Laufzeit und alle aufgezeichneten Seiteneffekte zurueck.
 sub reset_env {
@@ -22,11 +22,13 @@ sub reset_env {
 	$main::readingFnAttributes = '';
 	$main::init_done = 1;
 	@REQUESTS = ();
+	@CLOSED_REQUESTS = ();
 	@LOG_ENTRIES = ();
 	@TIMERS = ();
 	%KEY_VALUES = ();
 	$SET_KEY_VALUE_ERROR = undef;
 	$GET_KEY_VALUE_ERROR = undef;
+	$NOW = 1_000;
 	return;
 }
 
@@ -44,21 +46,39 @@ sub define_judo {
 # Liefert alle von HttpUtils entgegengenommenen, noch nicht beantworteten Requests.
 sub pending_requests { return \@REQUESTS; }
 
+# Liefert alle Auftraege, deren Verbindung explizit geschlossen wurde.
+sub closed_requests { return \@CLOSED_REQUESTS; }
+
+# Laesst bestehende Tests nach einer simulierten Antwort bis zum Folgerequest
+# fortschreiten, ohne deren feste Timerbasis zu veraendern.
+sub complete_dispatch_delay {
+	my ($hash) = @_;
+	$hash->{helper}{dispatch_not_before} = $NOW;
+	my ($timer) = grep {
+		$_->[1] eq 'Judo_dispatch_timer' && $_->[2] == $hash
+	} @TIMERS;
+	return if !$timer;
+	main::Judo_dispatch_timer($hash);
+	return;
+}
+
 # Beantwortet den aeltesten HTTP-Request mit einer erfolgreichen JSON-Antwort.
 sub complete_request {
-	my ($data, $code, $content) = @_;
+	my ($data, $code, $content, $preserve_delay) = @_;
 	my $request = shift @REQUESTS or die 'Kein HTTP-Request wartet';
 	$request->{code} = defined($code) ? $code : 200;
 	$content = encode_json({ data => $data }) if !defined $content;
 	$request->{callback}->($request, '', $content);
+	complete_dispatch_delay($request->{hash}) if !$preserve_delay;
 	return $request;
 }
 
 # Beantwortet den aeltesten HTTP-Request mit einem Transportfehler.
 sub fail_request {
-	my ($message) = @_;
+	my ($message, $preserve_delay) = @_;
 	my $request = shift @REQUESTS or die 'Kein HTTP-Request wartet';
 	$request->{callback}->($request, $message || 'simulierter Transportfehler', '');
+	complete_dispatch_delay($request->{hash}) if !$preserve_delay;
 	return $request;
 }
 
@@ -74,6 +94,24 @@ sub log_entries { return \@LOG_ENTRIES; }
 
 # Stellt alle aktuell geplanten internen Timer bereit.
 sub scheduled_timers { return \@TIMERS; }
+
+# Verschiebt die kontrollierte Testzeit um die angegebene Sekundenzahl.
+sub advance_time {
+	my ($seconds) = @_;
+	$NOW += $seconds;
+	return $NOW;
+}
+
+# Fuehrt den naechsten Dispatch-Timer mit der aktuellen Testzeit aus.
+sub fire_dispatch_timer {
+	my ($hash) = @_;
+	my ($timer) = sort { $a->[0] <=> $b->[0] } grep {
+		$_->[1] eq 'Judo_dispatch_timer' && (!defined($hash) || $_->[2] == $hash)
+	} @TIMERS;
+	return if !$timer;
+	main::Judo_dispatch_timer($timer->[2]);
+	return;
+}
 
 # Stellt den simulierten Key-Value-Speicher fuer gezielte Korruptionstests bereit.
 sub key_values { return \%KEY_VALUES; }
@@ -169,13 +207,21 @@ sub RemoveInternalTimer {
 	return undef;
 }
 
-# Liefert eine feste relative Timerbasis.
-sub gettimeofday { return 1_000; }
+# Liefert eine kontrollierbare relative Timerbasis.
+sub gettimeofday { return $JudoTestEnv::NOW; }
 
 # Zeichnet nichtblockierende HTTP-Requests zur kontrollierten Beantwortung auf.
 sub HttpUtils_NonblockingGet {
 	my ($request) = @_;
 	push @JudoTestEnv::REQUESTS, $request;
+	return undef;
+}
+
+# Schliesst einen laufenden Testrequest und entfernt ihn aus der Netzwerksicht.
+sub HttpUtils_Close {
+	my ($request) = @_;
+	push @JudoTestEnv::CLOSED_REQUESTS, $request;
+	@JudoTestEnv::REQUESTS = grep { $_ != $request } @JudoTestEnv::REQUESTS;
 	return undef;
 }
 

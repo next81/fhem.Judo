@@ -67,7 +67,12 @@ sub Judo_handle_success($$$) {
 
 		# Aendert sich die Modellnummer, werden noch wartende Kommandos des alten
 		# Profils verworfen, bevor das neue Profil seine Initialwerte plant.
-		if (!$hash->{helper}{family} || $hash->{helper}{model_id} != $model_id) {
+		my $model_changed = !$hash->{helper}{family}
+			|| !defined($hash->{helper}{model_id})
+			|| $hash->{helper}{model_id} != $model_id;
+
+		# Nur ein tatsaechlicher Modellwechsel ersetzt die alte Profilwarteschlange.
+		if ($model_changed) {
 			$hash->{helper}{queue} = [];
 			Judo_apply_model($hash, $model_id);
 		}
@@ -81,6 +86,12 @@ sub Judo_handle_success($$$) {
 			});
 			main::Judo_log($hash, 4,
 				"heartbeat completed count=$hash->{helper}{heartbeat_count}");
+
+			# Automatisches Profilpolling beginnt erst nach einem gueltigen Heartbeat;
+			# ein Modellwechsel besitzt bereits seine vollstaendige Initialabfrage.
+			if ($request->{poll_after_success} && !$model_changed) {
+				main::Judo_queue_poll($hash);
+			}
 		}
 		return;
 	}

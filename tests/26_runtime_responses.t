@@ -9,7 +9,7 @@ use Judo::Profiles qw(profiles);
 use lib 'tests/lib';
 use JudoTestEnv qw(
 	reset_env define_judo pending_requests complete_request fail_request
-	reading_value set_attribute
+	reading_value scheduled_timers set_attribute advance_time fire_dispatch_timer
 );
 
 BEGIN { $INC{'HttpUtils.pm'} = 1; }
@@ -23,6 +23,8 @@ sub discard_requests {
 	my ($hash) = @_;
 	@{ pending_requests() } = ();
 	main::Judo_clear_requests($hash);
+	delete $hash->{helper}{dispatch_not_before};
+	main::RemoveInternalTimer($hash, 'Judo_dispatch_timer');
 	return;
 }
 
@@ -147,12 +149,91 @@ subtest 'Queue dedupliziert und bleibt seriell' => sub {
 	discard_requests($hash);
 	main::Judo_heartbeat_timer($hash);
 	main::Judo_heartbeat_timer($hash);
-	is(request_codes($hash), ['FF00', '2800'],
-		'doppelter Timerlauf vervielfacht weder Heartbeat noch Profilpolling');
-	is(scalar(@{ pending_requests() }), 1, 'Pollingfolge bleibt seriell');
+	is(request_codes($hash), ['FF00'],
+		'doppelter Timerlauf vervielfacht den Heartbeat nicht');
+	is(scalar(@{ pending_requests() }), 1,
+		'vor erfolgreicher Heartbeatantwort ist kein Profilpoll eingereiht');
 	complete_request('44');
 	is(scalar(@{ pending_requests() }), 1, 'nach Heartbeat startet genau der naechste Pollrequest');
 	like(pending_requests()->[0]{url}, qr{/api/rest/2800$}, 'Profilpoll folgt erst nach dem Heartbeat');
+};
+
+subtest 'Folgerequests warten auch nach HTTP 429 fuenf Sekunden' => sub {
+	reset_env();
+	my ($hash) = define_judo('requestDelay', 'judo.local', 'user', 'password');
+	complete_request('44');
+	discard_requests($hash);
+	main::Judo_queue_get($hash, 'model', 'delay-first');
+	main::Judo_queue_get($hash, 'model', 'delay-second');
+	main::Judo_dispatch_next($hash);
+	is(scalar(@{ pending_requests() }), 1, 'nur der erste Request ist aktiv');
+	is(scalar(@{ $hash->{helper}{queue} }), 1, 'der zweite Request bleibt in der Queue');
+
+	# Die Busy-Antwort beendet den aktiven Request, darf die Queue aber nicht
+	# ohne die feste Schutzpause weiterlaufen lassen.
+	my $busy_request = shift @{ pending_requests() };
+	$busy_request->{code} = 429;
+	$busy_request->{httpheader} = "Retry-After: 2\r\n";
+	$busy_request->{callback}->($busy_request, '', '');
+	is(scalar(@{ pending_requests() }), 0, 'direkt nach HTTP 429 ist kein Request aktiv');
+	my @dispatch_timers = grep {
+		$_->[1] eq 'Judo_dispatch_timer'
+	} @{ scheduled_timers() };
+	is(scalar(@dispatch_timers), 1, 'mehrfache Dispatch-Versuche erzeugen nur einen Timer');
+	is($dispatch_timers[0][0], 1_005, 'der Folgerequest ist auf fuenf Sekunden terminiert');
+
+	# Vor Ablauf bleibt auch ein expliziter Timeraufruf ohne Netzwerkrequest.
+	advance_time(4);
+	fire_dispatch_timer($hash);
+	is(scalar(@{ pending_requests() }), 0, 'nach vier Sekunden bleibt die Verbindung frei');
+
+	# Nach der vollen Pause wird exakt der wartende Einzelrequest versendet.
+	advance_time(1);
+	fire_dispatch_timer($hash);
+	is(scalar(@{ pending_requests() }), 1, 'nach fuenf Sekunden startet genau ein Folgerequest');
+	is(scalar(@{ $hash->{helper}{queue} }), 0, 'der versendete Request wurde einmalig entnommen');
+};
+
+subtest 'Offline werden nur Heartbeats im langsameren Intervall ausgefuehrt' => sub {
+	reset_env();
+	my ($hash) = define_judo('offlinePolling', 'judo.local', 'user', 'password');
+	complete_request('33');
+	discard_requests($hash);
+	set_attribute($hash, 'maxFailures', 1);
+	set_attribute($hash, 'offlineInterval', 420);
+	main::Judo_heartbeat_timer($hash);
+	is(request_codes($hash), ['FF00'],
+		'automatischer Zyklus beginnt ausschliesslich mit dem Heartbeat');
+	complete_request('33');
+	is(request_codes($hash), [qw(2800 2900 5600)],
+		'erfolgreicher Heartbeat reiht die Profilwerte ein');
+	fail_request('Verbindung abgelehnt');
+	is(reading_value('offlinePolling', 'availability'), 'offline',
+		'Transportfehler des ersten Pollwerts setzt das Device offline');
+	is(request_codes($hash), [],
+		'wartende automatische Pollwerte werden beim Offline-Uebergang verworfen');
+	my ($offline_timer) = grep {
+		$_->[1] eq 'Judo_heartbeat_timer'
+	} @{ scheduled_timers() };
+	is($offline_timer->[0], 1_420,
+		'Offline-Uebergang plant den naechsten Versuch mit offlineInterval');
+
+	main::Judo_heartbeat_timer($hash);
+	is(request_codes($hash), ['FF00'], 'offline wird nur FF00 angefragt');
+	fail_request('weiterhin nicht erreichbar');
+	is(request_codes($hash), [], 'fehlgeschlagener Offline-Heartbeat erzeugt keine Pollwerte');
+
+	main::Judo_heartbeat_timer($hash);
+	complete_request('33');
+	is(reading_value('offlinePolling', 'availability'), 'online',
+		'erfolgreicher Offline-Heartbeat stellt den Onlinezustand wieder her');
+	is(request_codes($hash), [qw(2800 2900 5600)],
+		'nach der Erholung werden die Profilwerte wieder eingereiht');
+	my ($online_timer) = grep {
+		$_->[1] eq 'Judo_heartbeat_timer'
+	} @{ scheduled_timers() };
+	is($online_timer->[0], 1_060,
+		'nach der Erholung gilt wieder das normale Intervall');
 };
 
 subtest 'Erfolgreiches Set plant gezielten Refresh' => sub {

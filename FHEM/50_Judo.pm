@@ -20,7 +20,8 @@ use Judo::Auth qw(
 use Judo::Connection qw(
 	Judo_schedule_reconnect Judo_reconnect_timer Judo_clear_requests
 	Judo_start Judo_schedule_heartbeat Judo_heartbeat_timer
-	Judo_queue_get Judo_enqueue_request Judo_dispatch_next Judo_Callback
+	Judo_queue_get Judo_queue_poll Judo_enqueue_request
+	Judo_dispatch_timer Judo_dispatch_next Judo_Callback
 	Judo_parse_response Judo_mark_failure
 );
 use Judo::Protocol qw(
@@ -35,10 +36,12 @@ use Judo::Runtime qw(
 );
 use vars qw(%defs %attr $readingFnAttributes $init_done);
 
-our $Judo_VERSION = '1.1.0';
+our $Judo_VERSION = '1.2.0';
 our $Judo_DEFAULT_INTERVAL = 60;
+our $Judo_DEFAULT_OFFLINE_INTERVAL = 300;
 our $Judo_DEFAULT_TIMEOUT = 60;
 our $Judo_DEFAULT_MAX_FAILURES = 3;
+our $Judo_REQUEST_DELAY = 5;
 
 # --- FHEM-Zugriffe und Logging ------------------------------------------------
 
@@ -176,7 +179,8 @@ sub Judo_Initialize($) {
 	$hash->{AttrFn} = 'Judo_Attr';
 	$hash->{NotifyFn} = 'Judo_Notify';
 	$hash->{FW_deviceOverview} = 1;
-	$hash->{AttrList} = 'interval timeout maxFailures username ssl:0,1 disable:0,1 ' . $readingFnAttributes;
+	$hash->{AttrList} = 'interval offlineInterval timeout maxFailures username ssl:0,1 disable:0,1 '
+		. $readingFnAttributes;
 	return;
 }
 
@@ -250,6 +254,9 @@ sub Judo_Attr(@) {
 	if ($operation eq 'set' && $attribute eq 'interval') {
 		return 'interval muss 0 oder eine ganze Zahl zwischen 10 und 86400 Sekunden sein'
 			if $value !~ /^\d+$/ || ($value != 0 && ($value < 10 || $value > 86400));
+	} elsif ($operation eq 'set' && $attribute eq 'offlineInterval') {
+		return 'offlineInterval muss eine ganze Zahl zwischen 10 und 86400 Sekunden sein'
+			if $value !~ /^\d+$/ || $value < 10 || $value > 86400;
 	} elsif ($operation eq 'set' && $attribute eq 'timeout') {
 		return 'timeout muss eine ganze Zahl zwischen 1 und 300 Sekunden sein'
 			if $value !~ /^\d+$/ || $value < 1 || $value > 300;
@@ -283,7 +290,7 @@ sub Judo_Attr(@) {
 
 	# Verbindungs- und Timerattribute werden erst nach ihrer Uebernahme durch FHEM
 	# in einem kurzen internen Timer neu ausgewertet.
-	if ($attribute =~ /^(?:interval|timeout|maxFailures|username|ssl)$/) {
+	if ($attribute =~ /^(?:interval|offlineInterval|timeout|maxFailures|username|ssl)$/) {
 		my $detail = $attribute eq 'username' ? '' : " value=$value";
 		Judo_log($hash, 3,
 			"attribute name=$attribute operation=$operation$detail; reconnect scheduled");
@@ -492,8 +499,9 @@ nicht in URLs oder Logs geschrieben. Das Modul fuehrt kein C<save> aus.
 <a id="Judo"></a>
 <h3>Judo</h3>
 <p>Connects supported Judo devices through their local REST API. The device type
-is read before any family-specific request. Requests are serialized and
-<code>FF00</code> provides a non-mutating heartbeat.</p>
+is read before any family-specific request. Requests are serialized with a
+five-second minimum gap, and <code>FF00</code> provides a non-mutating heartbeat.
+Active HTTP requests are closed before reconnecting or disabling the device.</p>
 
 <a id="Judo-define"></a>
 <h4>Define</h4>
@@ -506,7 +514,8 @@ is read before any family-specific request. Requests are serialized and
 and <code>lastContact</code> show connectivity and heartbeat quality.
 <code>lastError</code>, <code>lastErrorCode</code>,
 <code>lastErrorCommand</code> and <code>errorCount</code> describe current errors
-without exposing credentials.</p>
+without exposing credentials. While offline, only <code>FF00</code> is requested;
+profile polling resumes after a successful heartbeat.</p>
 
 <a id="Judo-set"></a>
 <h4>Set</h4>
@@ -733,6 +742,10 @@ Sets the HTTP Basic user name. Colons and control characters are rejected.</li>
 <li><code>interval &lt;0|10..86400&gt;</code><br>
 Sets the heartbeat and polling interval in seconds. 0 disables the timer; the
 default is 60.</li>
+<a id="Judo-attr-offlineInterval"></a>
+<li><code>offlineInterval &lt;10..86400&gt;</code><br>
+Sets the heartbeat interval while the device is offline; the default is 300.
+Profile values are not polled until this heartbeat succeeds.</li>
 <a id="Judo-attr-timeout"></a>
 <li><code>timeout &lt;1..300&gt;</code><br>
 Sets the HTTP timeout in seconds; the default is 60.</li>
@@ -754,7 +767,8 @@ With 1, stops requests and timers and marks the device disabled. 0 enables it.</
 <h3>Judo</h3>
 <p>Bindet unterstuetzte Judo-Geraete ueber deren lokale REST-API an. Vor jedem
 familienabhaengigen Kommando wird zuerst der Geraetetyp ueber <code>FF00</code>
-bestimmt. Alle Requests laufen seriell.</p>
+bestimmt. Alle Requests laufen seriell mit mindestens fuenf Sekunden Abstand.
+Vor Reconnect oder Deaktivierung wird ein aktiver HTTP-Request geschlossen.</p>
 
 <a id="Judo-define"></a>
 <h4>Define</h4>
@@ -767,7 +781,9 @@ bestimmt. Alle Requests laufen seriell.</p>
 und <code>lastContact</code> machen Erreichbarkeit und Heartbeat-Qualitaet
 sichtbar. <code>lastError</code>, <code>lastErrorCode</code>,
 <code>lastErrorCommand</code> und <code>errorCount</code> beschreiben aktuelle
-Fehler, ohne Zugangsdaten offenzulegen.</p>
+Fehler, ohne Zugangsdaten offenzulegen. Offline wird ausschliesslich
+<code>FF00</code> abgefragt; Profilwerte folgen erst wieder nach einem
+erfolgreichen Heartbeat.</p>
 
 <a id="Judo-set"></a>
 <h4>Set</h4>
@@ -997,6 +1013,10 @@ Verwendet HTTP mit 0 (Standard) oder HTTPS mit 1.</li>
 <li><code>interval &lt;0|10..86400&gt;</code><br>
 Setzt das Heartbeat- und Pollingintervall in Sekunden. 0 deaktiviert den Timer;
 Standard ist 60.</li>
+<a id="Judo-attr-offlineInterval"></a>
+<li><code>offlineInterval &lt;10..86400&gt;</code><br>
+Setzt das Heartbeatintervall im Offline-Zustand; Standard ist 300 Sekunden.
+Profilwerte werden erst nach einem erfolgreichen Heartbeat wieder abgefragt.</li>
 <a id="Judo-attr-timeout"></a>
 <li><code>timeout &lt;1..300&gt;</code><br>
 Setzt den HTTP-Timeout in Sekunden; Standard ist 60.</li>

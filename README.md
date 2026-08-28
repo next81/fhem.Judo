@@ -37,7 +37,10 @@ Das Modul erkennt zuerst über das bei allen dokumentierten Geräten lesbare Kom
                        Modellbestimmung und Verarbeitung von Antworten
 ```
 
-Alle HTTP-Aufträge werden bewusst seriell ausgeführt. Ein langsames Gerät erhält deshalb nie mehrere konkurrierende REST-Anfragen derselben Modulinstanz.
+Alle HTTP-Aufträge werden bewusst seriell ausgeführt. Ein langsames Gerät erhält
+deshalb nie mehrere konkurrierende REST-Anfragen derselben Modulinstanz. Zwischen
+dem Ende oder Abbruch eines Requests und dem nächsten Request liegen mindestens
+fünf Sekunden.
 
 ## Funktionen
 
@@ -108,6 +111,7 @@ Sobald Benutzername und Passwort vorhanden sind, beginnt die Modellerkennung mit
 | `username` | Benutzername für HTTP Basic | – |
 | `ssl` | `0` für HTTP, `1` für HTTPS | `0` |
 | `interval` | Heartbeat- und Pollingintervall in Sekunden; `0` deaktiviert den Timer | `60` |
+| `offlineInterval` | Heartbeatintervall im Offline-Zustand in Sekunden | `300` |
 | `timeout` | HTTP-Timeout in Sekunden | `60` |
 | `maxFailures` | aufeinanderfolgende Transportfehler bis `offline` | `3` |
 | `disable` | `1` stoppt Requests und Timer, `0` aktiviert das Device | `0` |
@@ -116,6 +120,7 @@ Beispiel:
 
 ```text
 attr Judo interval 120
+attr Judo offlineInterval 300
 attr Judo timeout 30
 attr Judo maxFailures 3
 attr Judo ssl 0
@@ -124,6 +129,7 @@ attr Judo ssl 0
 Zulässige Grenzen:
 
 - `interval`: `0` oder `10` bis `86400` Sekunden
+- `offlineInterval`: `10` bis `86400` Sekunden
 - `timeout`: `1` bis `300` Sekunden
 - `maxFailures`: `1` bis `10`
 - `ssl` und `disable`: ausschließlich `0` oder `1`
@@ -257,11 +263,12 @@ Der Timer arbeitet in folgender Reihenfolge:
 Intervall erreicht
       |
       +-- FF00 lesen
-      |     Gerät erreichbar und Modell weiterhin gültig?
-      |
-      +-- profilabhängige Pollwerte seriell lesen
-      |
-      +-- nächsten Timer planen
+            |
+            +-- erfolgreich: profilabhängige Pollwerte seriell lesen
+            |                und nächsten Timer mit `interval` planen
+            |
+            +-- offline:     keine Profilwerte abfragen und nächsten
+                             Timer mit `offlineInterval` planen
 ```
 
 Standardmäßig werden folgende Werte automatisch gepollt:
@@ -274,7 +281,13 @@ Standardmäßig werden folgende Werte automatisch gepollt:
 | `idos` | `totalWater`, `status` |
 | `ifill` | `totalWater` |
 
-`interval 0` deaktiviert den automatischen Timer. Manuelle `get`- und `set`-Kommandos bleiben verfügbar.
+Im Offline-Zustand wird ausschließlich `FF00` als sicherer Heartbeat abgefragt.
+Erst ein erfolgreicher Heartbeat aktiviert die profilabhängigen Pollwerte wieder.
+Profil- und Initialabfragen laufen ebenfalls einzeln und mit fünf Sekunden Abstand.
+Bei Reconnect, Deaktivierung oder Löschen des Devices wird ein aktiver
+HttpUtils-Request geschlossen, bevor ein neuer Request zugelassen werden kann.
+`interval 0` deaktiviert den automatischen Timer vollständig. Manuelle `get`-
+und `set`-Kommandos bleiben verfügbar.
 
 ## Readings und Überwachung
 

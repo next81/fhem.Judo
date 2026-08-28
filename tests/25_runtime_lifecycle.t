@@ -8,6 +8,7 @@ use lib 'tests/lib';
 use JudoTestEnv qw(
 	reset_env define_judo pending_requests complete_request reading_value log_entries
 	scheduled_timers set_attribute key_values set_key_value_errors
+	closed_requests advance_time fire_dispatch_timer
 );
 
 BEGIN { $INC{'HttpUtils.pm'} = 1; }
@@ -21,6 +22,8 @@ sub discard_requests {
 	my ($hash) = @_;
 	@{ pending_requests() } = ();
 	main::Judo_clear_requests($hash);
+	delete $hash->{helper}{dispatch_not_before};
+	main::RemoveInternalTimer($hash, 'Judo_dispatch_timer');
 	return;
 }
 
@@ -96,6 +99,12 @@ subtest 'Host- und Attributvalidierung' => sub {
 		'zu kurzes Intervall wird abgelehnt');
 	is(main::Judo_Attr('set', 'attributes', 'interval', '0'), undef,
 		'Intervall null ist zum Abschalten erlaubt');
+	like(main::Judo_Attr('set', 'attributes', 'offlineInterval', '9'),
+		qr/zwischen 10 und 86400/, 'zu kurzes Offlineintervall wird abgelehnt');
+	like(main::Judo_Attr('set', 'attributes', 'offlineInterval', '86401'),
+		qr/zwischen 10 und 86400/, 'zu langes Offlineintervall wird abgelehnt');
+	is(main::Judo_Attr('set', 'attributes', 'offlineInterval', '300'), undef,
+		'gueltiges Offlineintervall wird akzeptiert');
 	like(main::Judo_Attr('set', 'attributes', 'timeout', '0'), qr/zwischen 1 und 300/,
 		'Timeout null wird abgelehnt');
 	like(main::Judo_Attr('set', 'attributes', 'timeout', '301'), qr/zwischen 1 und 300/,
@@ -181,10 +190,58 @@ subtest 'Notify, Reconnect, Heartbeatplanung und Undef' => sub {
 	main::Judo_schedule_heartbeat($hash);
 	ok(grep($_->[1] eq 'Judo_heartbeat_timer', @{ scheduled_timers() }),
 		'positives Intervall plant den Heartbeat erneut');
+	my ($offline_timer) = grep {
+		$_->[1] eq 'Judo_heartbeat_timer'
+	} @{ scheduled_timers() };
+	is($offline_timer->[0], 1_300,
+		'offline gilt standardmaessig ein Wiederholungsintervall von 300 Sekunden');
+	set_attribute($hash, 'offlineInterval', 420);
+	main::Judo_schedule_heartbeat($hash);
+	($offline_timer) = grep {
+		$_->[1] eq 'Judo_heartbeat_timer'
+	} @{ scheduled_timers() };
+	is($offline_timer->[0], 1_420,
+		'konfiguriertes Offlineintervall wird fuer den Timer verwendet');
+	main::Judo_reading($hash, 'availability', 'online');
+	main::Judo_schedule_heartbeat($hash);
+	my ($online_timer) = grep {
+		$_->[1] eq 'Judo_heartbeat_timer'
+	} @{ scheduled_timers() };
+	is($online_timer->[0], 1_060,
+		'online gilt wieder das normale Heartbeatintervall');
 	my $generation = $hash->{helper}{generation};
 	is(main::Judo_Undef($hash, ''), undef, 'Undef beendet die Instanz ohne Fehler');
 	is(scalar(@{ scheduled_timers() }), 0, 'Undef entfernt alle internen Timer');
 	ok($hash->{helper}{generation} > $generation, 'Undef entwertet spaete HTTP-Callbacks');
+};
+
+subtest 'Reconnect schliesst den aktiven Request und wahrt den Mindestabstand' => sub {
+	reset_env();
+	my ($hash) = define_judo('serializedReconnect', 'judo.local', 'user', 'password');
+	my $old_request = pending_requests()->[0];
+	is(scalar(@{ pending_requests() }), 1, 'vor Reconnect ist genau ein Netzwerkrequest aktiv');
+
+	main::Judo_start($hash);
+	is(closed_requests(), [$old_request], 'Reconnect schliesst den alten HttpUtils-Request');
+	is(scalar(@{ pending_requests() }), 0,
+		'waehrend der Schutzpause ist kein alter oder neuer Netzwerkrequest aktiv');
+	is(scalar(@{ $hash->{helper}{queue} }), 1, 'die neue Modellabfrage wartet in der Queue');
+	my ($dispatch_timer) = grep {
+		$_->[1] eq 'Judo_dispatch_timer'
+	} @{ scheduled_timers() };
+	is($dispatch_timer->[0], 1_005, 'der Ersatzrequest ist auf fuenf Sekunden terminiert');
+
+	# Ein verfruehter Timerlauf darf die Schutzpause nicht umgehen.
+	advance_time(4);
+	fire_dispatch_timer($hash);
+	is(scalar(@{ pending_requests() }), 0, 'nach vier Sekunden bleibt die Verbindung frei');
+
+	# Exakt nach Ablauf der Pause darf wieder ein einzelner Request starten.
+	advance_time(1);
+	fire_dispatch_timer($hash);
+	is(scalar(@{ pending_requests() }), 1, 'nach fuenf Sekunden startet genau ein Request');
+	like(pending_requests()->[0]{url}, qr{/api/rest/FF00$},
+		'der neue Einzelrequest ist die sichere Modellabfrage');
 };
 
 subtest 'Operatives Verbose-Logging und Geheimnisschutz' => sub {

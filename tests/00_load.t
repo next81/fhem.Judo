@@ -23,8 +23,9 @@ is($module->{SetFn}, 'Judo_Set', 'SetFn registriert');
 is($module->{AttrFn}, 'Judo_Attr', 'AttrFn registriert');
 is($module->{NotifyFn}, 'Judo_Notify', 'NotifyFn registriert');
 like($module->{AttrList}, qr/(?:^| )interval(?: |$)/, 'Heartbeatintervall registriert');
+like($module->{AttrList}, qr/(?:^| )offlineInterval(?: |$)/, 'Offlineintervall registriert');
 like($module->{AttrList}, qr/(?:^| )maxFailures(?: |$)/, 'Fehlerschwelle registriert');
-is($main::Judo_VERSION, '1.1.0', 'Modulversion gesetzt');
+is($main::Judo_VERSION, '1.2.0', 'Modulversion gesetzt');
 ok(-f 'lib/FHEM/Judo/Auth.pm', 'Authentifizierungsbibliothek wird ausgeliefert');
 ok(-f 'lib/FHEM/Judo/Connection.pm', 'Verbindungsbibliothek wird ausgeliefert');
 ok(-f 'lib/FHEM/Judo/Profiles.pm', 'Profilbibliothek wird ausgeliefert');
@@ -39,7 +40,7 @@ unlike($source, qr/checkAddresses/i, 'unsicherer Adressscan ist vollstaendig ent
 unlike($source, qr/Crypt::OpenSSL/, 'ungenutzte OpenSSL-Abhaengigkeit ist entfernt');
 unlike($source, qr{://[^\s]+:[^\s]+\@}, 'Quellcode baut keine Credential-URLs');
 unlike($source, qr/^sub Judo_(?:schedule_reconnect|reconnect_timer|clear_requests|start|
-	schedule_heartbeat|heartbeat_timer|queue_get|enqueue_request|dispatch_next|
+	schedule_heartbeat|heartbeat_timer|queue_get|queue_poll|enqueue_request|dispatch_next|
 	Callback|parse_response|mark_failure)\b/mx,
 	'Verbindungsfunktionen sind aus dem Hauptmodul ausgelagert');
 unlike($source, qr/^sub Judo_(?:profile|get_descriptor|handle_success|apply_model)\b/m,
@@ -56,7 +57,7 @@ $german_help //= '';
 my %help_entries = (
 	set => { map { $_ => 1 } qw(clearPassword password reconnect) },
 	get => { map { $_ => 1 } qw(heartbeat model profile) },
-	attr => { map { $_ => 1 } qw(interval timeout maxFailures username ssl disable) },
+	attr => { map { $_ => 1 } qw(interval offlineInterval timeout maxFailures username ssl disable) },
 );
 my $profiles = Judo::Profiles::profiles();
 

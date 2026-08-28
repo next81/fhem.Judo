@@ -17,7 +17,8 @@ use Judo::Protocol qw(Judo_build_get_code);
 our @EXPORT_OK = qw(
 	Judo_schedule_reconnect Judo_reconnect_timer Judo_clear_requests
 	Judo_start Judo_schedule_heartbeat Judo_heartbeat_timer
-	Judo_queue_get Judo_enqueue_request Judo_dispatch_next Judo_Callback
+	Judo_queue_get Judo_queue_poll Judo_enqueue_request
+	Judo_dispatch_timer Judo_dispatch_next Judo_Callback
 	Judo_parse_response Judo_mark_failure
 );
 
@@ -43,15 +44,28 @@ sub Judo_reconnect_timer($) {
 	return;
 }
 
-# Verwirft Queue und aktiven Request durch eine neue Generationsnummer. Spaete
-# Callbacks der alten Generation koennen dadurch keine Readings mehr aendern.
+# Verwirft Queue und aktiven Request durch eine neue Generationsnummer. Der
+# zugehoerige Socket wird vor der Freigabe geschlossen, damit ein Neustart
+# niemals parallel zu einem alten Netzwerkauftrag laeuft.
 sub Judo_clear_requests($) {
 	my ($hash) = @_;
 	my $queued = scalar @{ $hash->{helper}{queue} ||= [] };
 	my $active = $hash->{helper}{active_request};
 	my $active_id = $active ? ($active->{id} || 'unknown') : 'none';
 	$hash->{helper}{generation} = ($hash->{helper}{generation} || 0) + 1;
+	main::RemoveInternalTimer($hash, 'Judo_dispatch_timer');
 	$hash->{helper}{queue} = [];
+	my $http_param = delete $hash->{helper}{active_http_param};
+
+	# Ein bereits an HttpUtils uebergebener Auftrag wird tatsaechlich beendet,
+	# bevor active_request einen neuen Versand erlauben kann.
+	if ($http_param) {
+		main::HttpUtils_Close($http_param);
+		$hash->{helper}{dispatch_not_before} =
+			main::gettimeofday() + $main::Judo_REQUEST_DELAY;
+		main::Judo_log($hash, 4,
+			"active connection closed id=$active_id nextRequestDelay=$main::Judo_REQUEST_DELAY seconds");
+	}
 	delete $hash->{helper}{active_request};
 	main::Judo_log($hash, 4,
 		"requests cleared generation=$hash->{helper}{generation} queued=$queued activeId=$active_id");
@@ -89,7 +103,8 @@ sub Judo_start($) {
 	return;
 }
 
-# Plant den naechsten Heartbeat entsprechend dem validierten Intervallattribut.
+# Plant den naechsten Heartbeat online mit dem normalen und offline mit dem
+# langsameren Wiederanlaufintervall.
 sub Judo_schedule_heartbeat($) {
 	my ($hash) = @_;
 	main::RemoveInternalTimer($hash, 'Judo_heartbeat_timer');
@@ -97,20 +112,28 @@ sub Judo_schedule_heartbeat($) {
 		main::Judo_log($hash, 4, 'heartbeat scheduling skipped reason=disabled');
 		return;
 	}
-	my $interval = main::AttrVal($hash->{NAME}, 'interval', $main::Judo_DEFAULT_INTERVAL);
+	my $online_interval = main::AttrVal(
+		$hash->{NAME}, 'interval', $main::Judo_DEFAULT_INTERVAL);
 
-	# Ein Intervall von null deaktiviert bewusst nur das automatische Polling.
-	if (!$interval) {
+	# Ein Intervall von null deaktiviert die Automatik, aber keine manuellen Befehle.
+	if (!$online_interval) {
 		main::Judo_log($hash, 3, 'heartbeat scheduling disabled interval=0');
 		return;
 	}
+	my $offline = ($hash->{READINGS}{availability}{VAL} || 'offline') eq 'offline';
+	my $interval = $offline
+		? main::AttrVal(
+			$hash->{NAME}, 'offlineInterval', $main::Judo_DEFAULT_OFFLINE_INTERVAL)
+		: $online_interval;
+	my $mode = $offline ? 'offline' : 'online';
 	main::InternalTimer(main::gettimeofday() + $interval, 'Judo_heartbeat_timer', $hash, 0);
-	main::Judo_log($hash, 4, "heartbeat scheduled interval=$interval seconds");
+	main::Judo_log($hash, 4,
+		"heartbeat scheduled interval=$interval seconds mode=$mode");
 	return;
 }
 
-# Fragt FF00 als sicheren Heartbeat ab und haengt erst danach die fuer das
-# erkannte Profil dokumentierten Pollingwerte an.
+# Fragt FF00 als sicheren Heartbeat ab. Profilwerte werden erst von der
+# erfolgreichen und validierten Modellantwort eingereiht.
 sub Judo_heartbeat_timer($) {
 	my ($hash) = @_;
 	if (main::AttrVal($hash->{NAME}, 'disable', 0)) {
@@ -127,24 +150,15 @@ sub Judo_heartbeat_timer($) {
 		main::Judo_log($hash, 4, 'heartbeat skipped reason=credentialsMissing');
 		return;
 	}
-	Judo_queue_get($hash, 'model', $hash->{helper}{family} ? 'heartbeat' : 'discover');
-	my $profile = main::Judo_profile($hash);
-
-	# Profilwerte folgen seriell und koennen den Heartbeat nicht ueberholen.
-	if ($profile) {
-
-		for my $command (@{ $profile->{poll} }) {
-			Judo_queue_get($hash, $command, 'poll');
-		}
-
-	}
+	Judo_queue_get(
+		$hash, 'model', $hash->{helper}{family} ? 'heartbeat' : 'discover', 1);
 	Judo_dispatch_next($hash);
 	return;
 }
 
 # Stellt einen profilgebundenen Get-Request ohne doppelte Queue-Eintraege an.
-sub Judo_queue_get($$$) {
-	my ($hash, $command, $reason) = @_;
+sub Judo_queue_get($$$;$) {
+	my ($hash, $command, $reason, $poll_after_success) = @_;
 	my $descriptor = main::Judo_get_descriptor($hash, $command);
 
 	# Ein fehlender interner Deskriptor ist auf Verbose 4 nachvollziehbar, ohne
@@ -165,7 +179,30 @@ sub Judo_queue_get($$$) {
 	Judo_enqueue_request($hash, {
 		command => $command, mode => 'get', code => $code,
 		descriptor => $descriptor, reason => $reason,
+		poll_after_success => $poll_after_success ? 1 : 0,
 	});
+	return;
+}
+
+# Reiht die Profilwerte ausschliesslich nach einem erfolgreichen automatischen
+# Heartbeat ein und behaelt dabei die zentrale Deduplizierung bei.
+sub Judo_queue_poll($) {
+	my ($hash) = @_;
+	my $profile = main::Judo_profile($hash);
+
+	# Ohne erkanntes Profil existieren keine sicheren familienabhaengigen Pollwerte.
+	if (!$profile) {
+		main::Judo_log($hash, 4, 'polling skipped reason=profileMissing');
+		return;
+	}
+	main::Judo_log($hash, 4,
+		"polling queued count=" . scalar(@{ $profile->{poll} }));
+
+	# Alle Profilwerte folgen seriell auf den bereits validierten Heartbeat.
+	for my $command (@{ $profile->{poll} }) {
+		Judo_queue_get($hash, $command, 'poll');
+	}
+
 	return;
 }
 
@@ -202,8 +239,19 @@ sub Judo_enqueue_request($$) {
 	return;
 }
 
-# Sendet immer nur den ersten wartenden Request und uebergibt keine Zugangsdaten
-# im URL. HTTP Basic wird ausschliesslich im Authorization-Header transportiert.
+# Fuehrt einen wegen des Mindestabstands aufgeschobenen Versand erneut aus.
+sub Judo_dispatch_timer($) {
+	my ($hash) = @_;
+	if (main::AttrVal($hash->{NAME}, 'disable', 0)) {
+		main::Judo_log($hash, 4, 'dispatch timer skipped reason=disabled');
+		return;
+	}
+	Judo_dispatch_next($hash);
+	return;
+}
+
+# Sendet immer nur den ersten wartenden Request. Zwischen abgeschlossenen oder
+# aktiv abgebrochenen Netzwerkauftraegen liegt ein fester Mindestabstand.
 sub Judo_dispatch_next($) {
 	my ($hash) = @_;
 
@@ -217,8 +265,23 @@ sub Judo_dispatch_next($) {
 		main::Judo_log($hash, 4, 'dispatch skipped reason=disabled');
 		return;
 	}
-	my $request = shift @{ $hash->{helper}{queue} ||= [] };
-	return if !$request;
+	my $queue = $hash->{helper}{queue} ||= [];
+	return if !@$queue;
+	my $now = main::gettimeofday();
+	my $not_before = $hash->{helper}{dispatch_not_before} || 0;
+
+	# Folgeauftraege warten bis zum Ende der Schutzpause; ein einzelner Timer
+	# ersetzt dabei beliebig viele erneute Dispatch-Versuche.
+	if ($not_before > $now) {
+		main::RemoveInternalTimer($hash, 'Judo_dispatch_timer');
+		main::InternalTimer($not_before, 'Judo_dispatch_timer', $hash, 0);
+		main::Judo_log($hash, 5,
+			"dispatch delayed seconds=" . sprintf('%.3f', $not_before - $now));
+		return;
+	}
+	main::RemoveInternalTimer($hash, 'Judo_dispatch_timer');
+	delete $hash->{helper}{dispatch_not_before};
+	my $request = shift @$queue;
 	my $username = main::AttrVal($hash->{NAME}, 'username', '');
 	my $password = Judo_read_password($hash);
 
@@ -240,7 +303,7 @@ sub Judo_dispatch_next($) {
 			. " reason=" . ($request->{reason} || 'none')
 			. " timeout=$timeout queueRemaining=" . scalar(@{ $hash->{helper}{queue} })
 			. " url=$url");
-	main::HttpUtils_NonblockingGet({
+	my $http_param = {
 		url => $url,
 		method => 'GET',
 		timeout => $timeout,
@@ -252,7 +315,9 @@ sub Judo_dispatch_next($) {
 		request => $request,
 		generation => $request->{generation},
 		callback => \&Judo_Callback,
-	});
+	};
+	$hash->{helper}{active_http_param} = $http_param;
+	main::HttpUtils_NonblockingGet($http_param);
 	return;
 }
 
@@ -271,6 +336,9 @@ sub Judo_Callback($) {
 		return;
 	}
 	delete $hash->{helper}{active_request};
+	delete $hash->{helper}{active_http_param};
+	$hash->{helper}{dispatch_not_before} =
+		main::gettimeofday() + $main::Judo_REQUEST_DELAY;
 	my $http_code = $param->{code};
 	my $duration = defined($request->{started_at})
 		? main::gettimeofday() - $request->{started_at} : 0;
@@ -298,6 +366,12 @@ sub Judo_Callback($) {
 	main::Judo_reading($hash, 'availability', 'online');
 	main::Judo_log($hash, 2, "availability $previous_availability -> online")
 		if $previous_availability ne 'online';
+
+	# Der erste wieder erreichbare HTTP-Dienst wechselt sofort vom langsamen
+	# Offline- auf das normale Online-Intervall.
+	if ($previous_availability ne 'online') {
+		Judo_schedule_heartbeat($hash);
+	}
 
 	# Nur erfolgreiche 2xx-Antworten duerfen Nutzdaten oder Aktionsreadings setzen.
 	if (!defined($http_code) || $http_code < 200 || $http_code >= 300) {
@@ -363,10 +437,28 @@ sub Judo_mark_failure($$$) {
 	# die Erreichbarkeit nicht mehr gegeben.
 	if (!$hash->{helper}{last_success_epoch} || $failures >= $limit) {
 		my $previous_state = $hash->{READINGS}{state}{VAL} || '';
+		my $previous_availability = $hash->{READINGS}{availability}{VAL} || '';
 		main::Judo_readings($hash, { availability => 'offline', state => 'offline' });
 		main::Judo_log($hash, 2,
 			"state $previous_state -> offline failures=$failures limit=$limit")
 			if $previous_state ne 'offline';
+
+		# Nach dem Offline-Uebergang duerfen nur manuelle Auftraege und sichere
+		# Heartbeats in der Queue verbleiben.
+		my $queue = $hash->{helper}{queue} ||= [];
+		my $queued_before = scalar(@$queue);
+		@$queue = grep {
+			($_->{reason} || '') !~ /^(?:poll|init|refresh)$/
+		} @$queue;
+		my $removed = $queued_before - scalar(@$queue);
+		main::Judo_log($hash, 4, "automatic requests discarded count=$removed")
+			if $removed;
+
+		# Beim ersten Offline-Uebergang ersetzt das langsamere Intervall den bereits
+		# online geplanten Folgetermin.
+		if ($previous_availability ne 'offline') {
+			Judo_schedule_heartbeat($hash);
+		}
 	}
 	return;
 }

@@ -26,6 +26,8 @@ sub discard_requests {
 	my ($hash) = @_;
 	@{ pending_requests() } = ();
 	main::Judo_clear_requests($hash);
+	delete $hash->{helper}{dispatch_not_before};
+	main::RemoveInternalTimer($hash, 'Judo_dispatch_timer');
 }
 
 subtest 'Readings werden nur bei Aenderungen geschrieben' => sub {
@@ -197,7 +199,8 @@ subtest 'Modellwechsel verwirft Kommandos des alten Profils' => sub {
 	complete_request('44');
 	discard_requests($hash);
 	main::Judo_heartbeat_timer($hash);
-	is(request_codes($hash), [qw(FF00 2800)], 'ZEWA-Heartbeat hat Modell und Gesamtwasser geplant');
+	is(request_codes($hash), [qw(FF00)],
+		'ZEWA-Heartbeat plant vor seiner Antwort noch keinen Profilpoll');
 	complete_request('34');
 	is(reading_value('changingJudo', 'family'), 'softwell', 'neues SOFTwell-Profil ist aktiv');
 	is(request_codes($hash), [qw(0600 0100 0E00 2500 2900)],
@@ -232,6 +235,8 @@ subtest 'Eingaben und Attribute werden eng validiert' => sub {
 		'Get akzeptiert keine Teiltreffer');
 	like(main::Judo_Attr('set', 'validationJudo', 'interval', '5'), qr/zwischen 10 und 86400/,
 		'zu kurzes Intervall wird abgelehnt');
+	like(main::Judo_Attr('set', 'validationJudo', 'offlineInterval', '5'),
+		qr/zwischen 10 und 86400/, 'zu kurzes Offlineintervall wird abgelehnt');
 	like(main::Judo_Attr('set', 'validationJudo', 'username', 'bad:user'), qr/Doppelpunkt/,
 		'ungueltiger Basic-Auth-Benutzer wird abgelehnt');
 	like(main::Judo_Define({ NAME => 'bad' }, 'bad Judo http://judo.local'), qr/Ungueltiger Host/,
@@ -250,11 +255,12 @@ subtest 'Passwortverwaltung und disable stoppen Netzwerkarbeit' => sub {
 	is(reading_value('managedJudo', 'passwordStored'), 'yes', 'Passwortstatus ist sichtbar');
 	is(scalar(@{ pending_requests() }), 1, 'nach vollstaendigen Zugangsdaten beginnt FF00');
 	like(pending_requests()->[0]{url}, qr{/api/rest/FF00$}, 'Passwortstart bleibt bei sicherer Modellabfrage');
+	my $stale = pending_requests()->[0];
 
 	is(main::Judo_Attr('set', 'managedJudo', 'disable', '1'), undef, 'disable=1 wird akzeptiert');
 	is(reading_value('managedJudo', 'state'), 'disabled', 'disable setzt sichtbaren Zustand');
 	is(reading_value('managedJudo', 'availability'), 'offline', 'disable setzt Erreichbarkeit offline');
-	my $stale = shift @{ pending_requests() };
+	is(scalar(@{ pending_requests() }), 0, 'disable schliesst den laufenden Netzwerkrequest');
 	$stale->{code} = 200;
 	$stale->{callback}->($stale, '', '{"data":"44"}');
 	is(reading_value('managedJudo', 'state'), 'disabled', 'spaeter Callback kann disable nicht ueberschreiben');
